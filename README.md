@@ -4,7 +4,7 @@ Live monitoring dashboard for a pairs trading / statistical arbitrage engine run
 
 **Stack:** FastAPI · React · Recharts · alpaca-py · yfinance
 
-![Dashboard Preview](preview.png)
+![Dashboard Preview](image.png)
 
 ## Features
 
