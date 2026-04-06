@@ -12,6 +12,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from dotenv import load_dotenv
+import traceback
 
 load_dotenv()
 
@@ -25,7 +26,7 @@ app = FastAPI(title="StatArb Dashboard API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,16 +39,20 @@ PAIRS = [
 
 
 def compute_sharpe(returns: pd.Series, periods_per_year: int = 252) -> float:
-    if returns.std() == 0 or len(returns) < 2:
+    if returns.empty or pd.isna(returns.std()) or returns.std() == 0 or len(returns) < 2:
         return 0.0
-    return float((returns.mean() / returns.std()) * np.sqrt(periods_per_year))
-
+    val = (returns.mean() / returns.std()) * np.sqrt(periods_per_year)
+    return float(val) if not pd.isna(val) else 0.0
 
 def compute_max_drawdown(equity: pd.Series) -> float:
+    if len(equity) == 0:
+        return 0.0
     roll_max = equity.cummax()
     drawdown = (equity - roll_max) / roll_max
-    return float(drawdown.min())
-
+    if drawdown.isna().all():
+        return 0.0
+    val = drawdown.min()
+    return float(val) if not pd.isna(val) else 0.0
 
 @app.get("/health")
 def health():
@@ -70,13 +75,13 @@ def get_portfolio():
             "last_updated": datetime.utcnow().isoformat(),
         }
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/equity-curve")
 def get_equity_curve():
     try:
-        # Alpaca portfolio history — last 30 days, daily
         from alpaca.trading.requests import GetPortfolioHistoryRequest
         req = GetPortfolioHistoryRequest(
             period="1M",
@@ -85,8 +90,8 @@ def get_equity_curve():
         )
         history = trading_client.get_portfolio_history(req)
 
-        timestamps = history.timestamp
-        equity_vals = history.equity
+        timestamps = getattr(history, 'timestamp', [])
+        equity_vals = getattr(history, 'equity', [])
 
         data = []
         for ts, eq in zip(timestamps, equity_vals):
@@ -98,19 +103,20 @@ def get_equity_curve():
 
         equity_series = pd.Series([d["equity"] for d in data])
         returns = equity_series.pct_change().dropna()
+        
         sharpe = compute_sharpe(returns)
         max_dd = compute_max_drawdown(equity_series)
 
         return {
             "curve": data,
-            "sharpe_ratio": round(sharpe, 4),
-            "max_drawdown": round(max_dd * 100, 4),
+            "sharpe_ratio": round(sharpe, 4) if not pd.isna(sharpe) else 0.0,
+            "max_drawdown": round(max_dd * 100, 4) if not pd.isna(max_dd) else 0.0,
             "period": "1M",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
+    
+    
 @app.get("/positions")
 def get_positions():
     try:
@@ -129,7 +135,6 @@ def get_positions():
                 "cost_basis": float(p.cost_basis),
             })
 
-        # Compute pair-level P&L
         pos_map = {p["symbol"]: p for p in result}
         pair_pnl = []
         for pair in PAIRS:
@@ -149,30 +154,6 @@ def get_positions():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/trades")
-def get_trades():
-    try:
-        req = GetOrdersRequest(status=OrderStatus.ALL, limit=50)
-        orders = trading_client.get_orders(req)
-        result = []
-        for o in orders:
-            result.append({
-                "id": str(o.id),
-                "symbol": o.symbol,
-                "side": o.side.value,
-                "order_type": o.order_type.value,
-                "qty": float(o.qty) if o.qty else None,
-                "filled_qty": float(o.filled_qty) if o.filled_qty else 0,
-                "avg_fill_price": float(o.filled_avg_price) if o.filled_avg_price else None,
-                "status": o.status.value,
-                "submitted_at": o.submitted_at.isoformat() if o.submitted_at else None,
-                "filled_at": o.filled_at.isoformat() if o.filled_at else None,
-            })
-        return {"trades": result, "count": len(result)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.get("/stats")
 def get_stats():
     try:
@@ -180,17 +161,29 @@ def get_stats():
         req = GetPortfolioHistoryRequest(period="1M", timeframe="1D", extended_hours=False)
         history = trading_client.get_portfolio_history(req)
 
-        equity_vals = [float(e) for e in history.equity if e is not None]
+        equity_vals = [float(e) for e in getattr(history, 'equity', []) if e is not None and e > 0]
+        
+        if len(equity_vals) < 2:
+            return {
+                "sharpe_ratio": 0.0, "max_drawdown_pct": 0.0, "total_return_pct": 0.0,
+                "annualized_volatility_pct": 0.0, "win_rate_pct": 0.0, "avg_win_pct": 0.0,
+                "avg_loss_pct": 0.0, "num_trading_days": len(equity_vals), "profit_factor": 0.0
+            }
+
         equity_series = pd.Series(equity_vals)
         returns = equity_series.pct_change().dropna()
 
         sharpe = compute_sharpe(returns)
         max_dd = compute_max_drawdown(equity_series)
-        total_return = (equity_vals[-1] - equity_vals[0]) / equity_vals[0] * 100 if equity_vals else 0
-        volatility = float(returns.std() * np.sqrt(252) * 100) if len(returns) > 1 else 0
-        win_rate = float((returns > 0).sum() / len(returns) * 100) if len(returns) > 0 else 0
-        avg_win = float(returns[returns > 0].mean() * 100) if (returns > 0).any() else 0
-        avg_loss = float(returns[returns < 0].mean() * 100) if (returns < 0).any() else 0
+        total_return = (equity_vals[-1] - equity_vals[0]) / equity_vals[0] * 100
+        volatility = float(returns.std() * np.sqrt(252) * 100) if not pd.isna(returns.std()) else 0.0
+        
+        wins = returns[returns > 0]
+        losses = returns[returns < 0]
+        
+        win_rate = float(len(wins) / len(returns) * 100) if len(returns) > 0 else 0.0
+        avg_win = float(wins.mean() * 100) if not wins.empty else 0.0
+        avg_loss = float(losses.mean() * 100) if not losses.empty else 0.0
 
         return {
             "sharpe_ratio": round(sharpe, 4),
@@ -201,9 +194,52 @@ def get_stats():
             "avg_win_pct": round(avg_win, 4),
             "avg_loss_pct": round(avg_loss, 4),
             "num_trading_days": len(equity_vals),
-            "profit_factor": round(abs(avg_win / avg_loss), 3) if avg_loss != 0 else None,
+            "profit_factor": round(abs(avg_win / avg_loss), 3) if avg_loss != 0 else 0.0,
         }
     except Exception as e:
+        print(f"Stats Error: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/trades")
+def get_trades():
+    print("=== /trades called ===")
+    try:
+        # Use QueryOrderStatus or plain string — more compatible across SDK versions
+        req = GetOrdersRequest(status="all", limit=50)
+        orders = trading_client.get_orders(req)
+        print(f"=== fetched {len(orders)} orders ===")
+
+        def safe_val(obj, attr):
+            val = getattr(obj, attr, None)
+            if val is None:
+                return "unknown"
+            return getattr(val, 'value', str(val))
+
+        result = []
+        for o in orders:
+            try:
+                result.append({
+                    "id": str(getattr(o, 'id', '')),
+                    "symbol": getattr(o, 'symbol', 'Unknown'),
+                    "side": safe_val(o, 'side'),
+                    "order_type": safe_val(o, 'order_type'),
+                    "qty": float(o.qty) if o.qty is not None else 0.0,
+                    "filled_qty": float(o.filled_qty) if o.filled_qty is not None else 0.0,
+                    "avg_fill_price": float(o.filled_avg_price) if o.filled_avg_price is not None else 0.0,
+                    "status": safe_val(o, 'status'),
+                    "submitted_at": o.submitted_at.isoformat() if o.submitted_at else None,
+                    "filled_at": o.filled_at.isoformat() if o.filled_at else None,
+                })
+            except Exception as item_err:
+                print(f"Skipping order {getattr(o, 'id', '?')} due to error: {item_err}")
+                traceback.print_exc()
+                continue
+
+        return {"trades": result, "count": len(result)}
+    except Exception as e:
+        print("=== /trades CRASHED ===")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -225,7 +261,6 @@ def get_spreads():
             leg1_prices = df[pair["leg1"]]
             leg2_prices = df[pair["leg2"]]
 
-            # OLS hedge ratio
             from numpy.linalg import lstsq
             X = np.column_stack([leg2_prices.values, np.ones(len(leg2_prices))])
             beta, _, _, _ = lstsq(X, leg1_prices.values, rcond=None)
